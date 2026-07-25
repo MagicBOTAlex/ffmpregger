@@ -36,7 +36,6 @@
           ps.tqdm
         ]);
 
-        # Build 32-bit packages only on x86_64-linux, as 32-bit x86 packages (pkgsi686Linux) do not exist on ARM
         multiPackages =
           with pkgs;
           [
@@ -57,25 +56,29 @@
           ];
 
         fhs = pkgs.buildFHSEnv {
-          name = "pio-shell";
-          targetPkgs =
-            pkgs: with pkgs; [
-              neovim
-              git
-              fish
-              pythonEnv
-            ];
+          name = "pythonEnv-fhs";
+          targetPkgs = pkgs: with pkgs; [
+            neovim
+            git
+            fish
+            pythonEnv
+          ];
           multiPkgs = pkgs: multiPackages;
-
-          runScript = ''
-          '';
-
           profile = "export LC_ALL=C.UTF-8";
         };
       in
       {
-        devShells.default = fhs.env;
+        # Expose the FHS environment directly as an app/run target
+        apps.default = {
+          type = "app";
+          program = "${fhs}/bin/pythonEnv-fhs";
+        };
+
+        # Standard devShell that drops you straight into the FHS environment via `nix develop`
+        devShells.default = pkgs.mkShell {
+          nativeBuildInputs = [ fhs ];
+          shellHook = "exec pythonEnv-fhs";
+        };
       }
     );
 }
-
