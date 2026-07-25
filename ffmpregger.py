@@ -151,21 +151,21 @@ def process_file(src_path, dst_path, position_slot, main_pbar, lock):
 
                         if delta > 0:
                             # Update worker bar
-                            worker_bar.update(delta)
+                            worker_bar.update(round(delta))
 
                             # Update overall global progress bar (thread-safe)
                             with lock:
-                                main_pbar.update(delta)
+                                main_pbar.update(round(delta))
 
                             last_processed_sec = out_seconds
 
                     elif key == "speed":
-                        current_speed = val.strip()
+                        current_speed = round(float(val.strip()[:-1]), 1)
                     elif key == "fps":
-                        current_fps = val.strip()
+                        current_fps = int(float(val.strip()))
                     elif key == "progress" and val == "continue":
                         worker_bar.set_postfix_str(
-                            f"Speed: {current_speed} | FPS: {current_fps}"
+                            f"Speed: {current_speed}x | FPS: {current_fps}"
                         )
 
             process.wait()
