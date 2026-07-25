@@ -11,6 +11,40 @@ from tqdm import tqdm
 IMAGE_EXTS = {".jpg", ".jpeg"}
 VIDEO_EXTS = {".mkv", ".mp4", ".iso"}
 
+# Pre-defined GPU profiles
+PRESETS = {
+    "gtx1080": [
+        "-c:v", "hevc_nvenc",
+        "-preset", "p7",
+        "-tune", "hq",
+        "-rc", "constqp",
+        "-cq", "20",
+        "-spatial-aq", "1",
+    ],
+    "rtx4080s": [
+        "-c:v", "hevc_nvenc",
+        "-preset", "p7",            # Highest quality / slowest preset
+        "-tune", "hq",              # FFmpeg accepted NVENC tune parameter
+        "-multipass", "fullres",    # 2-Pass full resolution encoding
+        "-rc", "constqp",
+        "-cq", "20",
+        "-spatial-aq", "1",
+        "-bf", "3",                 # HEVC B-frames (supported on RTX 20/30/40 series)
+        "-b_ref_mode", "middle",    # B-frames used as references
+    ]
+}
+
+
+def parse_float_safe(val, default=0.0):
+    """Safely converts string or number to float, handling 'N/A' or empty strings."""
+    if val is None:
+        return default
+    val_str = str(val).strip().rstrip("xX")
+    try:
+        return float(val_str)
+    except ValueError:
+        return default
+
 
 def get_video_info(file_path):
     """
@@ -24,7 +58,7 @@ def get_video_info(file_path):
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height:format=duration",
+        "stream=width,height,duration:format=duration",
         "-of",
         "json",
         str(file_path),
@@ -35,7 +69,12 @@ def get_video_info(file_path):
         )
         data = json.loads(result.stdout)
         stream = data.get("streams", [{}])[0]
-        duration = float(data.get("format", {}).get("duration", 0))
+        fmt = data.get("format", {})
+
+        # Try format duration first, fall back to stream duration
+        raw_duration = fmt.get("duration") or stream.get("duration")
+        duration = parse_float_safe(raw_duration, default=0.0)
+
         return stream.get("width"), stream.get("height"), duration
     except Exception:
         return None, None, 0.0
@@ -43,17 +82,19 @@ def get_video_info(file_path):
 
 def parse_time_to_seconds(time_str):
     """Converts HH:MM:SS.microseconds into total seconds."""
+    if not time_str or "N/A" in time_str:
+        return 0.0
     try:
         parts = time_str.split(":")
         if len(parts) == 3:
             h, m, s = parts
-            return float(h) * 3600 + float(m) * 60 + float(s)
+            return float(h) * 3600 + float(m) * 60 + parse_float_safe(s)
     except ValueError:
         pass
     return 0.0
 
 
-def process_file(src_path, dst_path, position_slot, main_pbar, lock):
+def process_file(src_path, dst_path, position_slot, main_pbar, lock, enc_args):
     """
     Handles a single file: direct copies or tracks video transcode progress.
     Updates worker progress and continuously updates the shared main progress bar.
@@ -68,7 +109,7 @@ def process_file(src_path, dst_path, position_slot, main_pbar, lock):
 
     # 2. Transcode video files
     if ext in VIDEO_EXTS:
-        dst_path = dst_path.with_suffix(".mp4")
+        dst_path = dst_path.with_suffix(".mkv")
         width, height, duration = get_video_info(src_path)
 
         cmd = [
@@ -78,6 +119,8 @@ def process_file(src_path, dst_path, position_slot, main_pbar, lock):
             "cuda",
             "-i",
             str(src_path),
+            "-map",
+            "0",  # Preserves all video, audio, and subtitle streams
         ]
 
         if width and height and (width > 1920 or height > 1080):
@@ -88,26 +131,20 @@ def process_file(src_path, dst_path, position_slot, main_pbar, lock):
                 ]
             )
 
+        # Inject encoder arguments (GTX 1080 / RTX 4080 Super)
+        cmd.extend(enc_args)
+
+        # Audio, Subtitle copy, and Progress Flags
         cmd.extend(
             [
-                "-c:v",
-                "hevc_nvenc",
-                "-preset",
-                "p7",
-                "-tune",
-                "hq",
-                "-rc",
-                "constqp",
-                "-cq",
-                "20",
-                "-spatial-aq",
-                "1",
                 "-c:a",
                 "aac",
                 "-b:a",
                 "192k",
+                "-c:s",
+                "copy",  # Direct pass-through for subtitle streams (srt/ass)
                 "-progress",
-                "pipe:1",  # Output machine-readable progress to stdout
+                "pipe:1",
                 "-nostats",
                 str(dst_path),
             ]
@@ -118,7 +155,7 @@ def process_file(src_path, dst_path, position_slot, main_pbar, lock):
         )
         total_units = int(duration) if duration > 0 else 100
 
-        # Worker progress bar with ETA/remaining time estimate
+        # Worker progress bar
         worker_bar = tqdm(
             total=total_units,
             desc=f"Worker {position_slot + 1} [{short_filename}]",
@@ -145,32 +182,35 @@ def process_file(src_path, dst_path, position_slot, main_pbar, lock):
                 line = line.strip()
                 if "=" in line:
                     key, val = line.split("=", 1)
+                    val = val.strip()
+
                     if key == "out_time":
                         out_seconds = parse_time_to_seconds(val)
                         delta = out_seconds - last_processed_sec
 
                         if delta > 0:
-                            # Update worker bar
                             worker_bar.update(round(delta))
 
-                            # Update overall global progress bar (thread-safe)
                             with lock:
                                 main_pbar.update(round(delta))
 
                             last_processed_sec = out_seconds
 
                     elif key == "speed":
-                        current_speed = round(float(val.strip()[:-1]), 1)
+                        if "N/A" in val:
+                            current_speed = "N/A"
+                        else:
+                            spd = parse_float_safe(val)
+                            current_speed = f"{round(spd, 1)}x"
                     elif key == "fps":
-                        current_fps = int(float(val.strip()))
+                        current_fps = str(int(parse_float_safe(val)))
                     elif key == "progress" and val == "continue":
                         worker_bar.set_postfix_str(
-                            f"Speed: {current_speed}x | FPS: {current_fps}"
+                            f"Speed: {current_speed} | FPS: {current_fps}"
                         )
 
             process.wait()
 
-            # Fill in any remaining fraction to complete the bar cleanly
             remaining_delta = total_units - worker_bar.n
             if remaining_delta > 0:
                 worker_bar.update(remaining_delta)
@@ -197,10 +237,17 @@ def process_file(src_path, dst_path, position_slot, main_pbar, lock):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Recursive Media Converter for NVENC Pascal GPUs"
+        description="Recursive Media Converter supporting Pascal (GTX 1080) & Ada Lovelace (RTX 4080 Super) NVENC."
     )
     parser.add_argument("src", type=str, help="Source directory")
     parser.add_argument("dst", type=str, help="Destination directory")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=["gtx1080", "rtx4080s"],
+        default="gtx1080",
+        help="Target GPU encoding profile (default: gtx1080)",
+    )
     parser.add_argument(
         "--workers",
         type=int,
@@ -216,28 +263,29 @@ def main():
         print(f"Error: Source directory '{src_dir}' does not exist.")
         return
 
+    encoder_args = PRESETS[args.preset]
+
     valid_exts = IMAGE_EXTS | VIDEO_EXTS
     files_to_process = [
         p for p in src_dir.rglob("*") if p.is_file() and p.suffix.lower() in valid_exts
     ]
 
-    print(f"Found {len(files_to_process)} target files. Calculating total duration...")
+    print(
+        f"Found {len(files_to_process)} target files. Using profile [{args.preset.upper()}]. Calculating total duration..."
+    )
 
-    # Pre-calculate total video duration for accurate overall ETA
     total_duration_sec = 0.0
     for p in files_to_process:
         if p.suffix.lower() in VIDEO_EXTS:
             _, _, duration = get_video_info(p)
             total_duration_sec += duration
 
-    # Thread lock to safely update the shared global progress bar
     lock = threading.Lock()
     available_slots = list(range(args.workers))
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {}
 
-        # Main progress bar tracks total video seconds remaining
         main_pbar = tqdm(
             total=int(total_duration_sec)
             if total_duration_sec > 0
@@ -250,7 +298,6 @@ def main():
 
         for src_path in files_to_process:
             while not available_slots:
-                # Wait for any worker to finish and free its slot
                 done_futures = [f for f in futures if f.done()]
                 for f in done_futures:
                     slot = futures.pop(f)
@@ -264,11 +311,10 @@ def main():
             dst_path = dst_dir / rel_path
 
             future = executor.submit(
-                process_file, src_path, dst_path, slot, main_pbar, lock
+                process_file, src_path, dst_path, slot, main_pbar, lock, encoder_args
             )
             futures[future] = slot
 
-        # Drain remaining running tasks
         for future in as_completed(futures):
             success, msg = future.result()
             if not success:
